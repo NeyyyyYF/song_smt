@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""
+Fully automatic point cloud registration + fusion for two PLY files.
+
+Default inputs:
+  - align1.ply (reference / target)
+  - align2.ply (to be transformed / source)
+Output:
+  - merged.ply
+
+Pipeline:
+1) Read point clouds
+2) Auto-estimate average nearest-neighbor spacing
+3) Adaptive voxel downsampling + normal estimation + FPFH
+4) RANSAC global registration (coarse)
+5) Open3D Tensor ICP refinement (GPU if CUDA is available)
+6) Transform source into target frame, merge and de-duplicate overlap
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Tuple
+
+import numpy as np
+import open3d as o3d
+
+
+@dataclass
+class AdaptiveParams:
+    spacing: float
+    voxel_size: float
+    normal_radius: float
+    fpfh_radius: float
+    ransac_distance: float
+    icp_distance_coarse: float
+    icp_distance_fine: float
+    merge_voxel: float
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+def safe_float(x: float, fallback: float) -> float:
+    if np.isfinite(x) and x > 0:
+        return float(x)
+    return float(fallback)
+
+
+def estimate_avg_nn_spacing(
+    pcd: o3d.geometry.PointCloud, sample_size: int = 20000
+) -> float:
+    """
+    Estimate average nearest-neighbor spacing from a random subset.
+    """
+    pts = np.asarray(pcd.points)
+    if pts.shape[0] < 3:
+        return 0.0
+
+    n = pts.shape[0]
+    m = min(sample_size, n)
+    rng = np.random.default_rng(42)
+    sample_idx = rng.choice(n, size=m, replace=False)
+
+    tree = o3d.geometry.KDTreeFlann(pcd)
+    dists = []
+    for idx in sample_idx:
+        # k=2 because first neighbor is itself
+        _, _, sq_d = tree.search_knn_vector_3d(pcd.points[int(idx)], 2)
+        if len(sq_d) >= 2:
+            nn = np.sqrt(float(sq_d[1]))
+            if np.isfinite(nn) and nn > 0:
+                dists.append(nn)
+
+    if not dists:
+        return 0.0
+    return float(np.mean(dists))
+
+
+def compute_adaptive_params(
+    pcd_a: o3d.geometry.PointCloud, pcd_b: o3d.geometry.PointCloud
+) -> AdaptiveParams:
+    spacing_a = estimate_avg_nn_spacing(pcd_a)
+    spacing_b = estimate_avg_nn_spacing(pcd_b)
+
+    all_pts = np.vstack([np.asarray(pcd_a.points), np.asarray(pcd_b.points)])
+    bbox_min = np.min(all_pts, axis=0)
+    bbox_max = np.max(all_pts, axis=0)
+    diag = float(np.linalg.norm(bbox_max - bbox_min))
+
+    # Fallback spacing from scene scale if NN spacing fails.
+    fallback_spacing = max(diag * 1e-4, 1e-6)
+    spacing = safe_float(
+        np.mean([s for s in (spacing_a, spacing_b) if s > 0]), fallback_spacing
+    )
+
+    # Adaptive multipliers (tuned for robust coarse-to-fine registration).
+    voxel_size = spacing * 4.0
+    normal_radius = spacing * 8.0
+    fpfh_radius = spacing * 20.0
+    ransac_distance = spacing * 12.0
+    icp_distance_coarse = spacing * 4.0
+    icp_distance_fine = spacing * 1.5
+    merge_voxel = spacing * 1.2
+
+    # Clamp to avoid pathological values.
+    min_len = max(diag * 1e-6, 1e-7)
+    max_len = max(diag * 0.05, min_len * 10.0)
+    clamp = lambda v: float(np.clip(v, min_len, max_len))
+
+    return AdaptiveParams(
+        spacing=clamp(spacing),
+        voxel_size=clamp(voxel_size),
+        normal_radius=clamp(normal_radius),
+        fpfh_radius=clamp(fpfh_radius),
+        ransac_distance=clamp(ransac_distance),
+        icp_distance_coarse=clamp(icp_distance_coarse),
+        icp_distance_fine=clamp(icp_distance_fine),
+        merge_voxel=clamp(merge_voxel),
+    )
+
+
+def preprocess_for_global_registration(
+    pcd: o3d.geometry.PointCloud,
+    voxel_size: float,
+    normal_radius: float,
+    fpfh_radius: float,
+) -> Tuple[o3d.geometry.PointCloud, o3d.pipelines.registration.Feature]:
+    pcd_down = pcd.voxel_down_sample(voxel_size)
+    if len(pcd_down.points) < 50:
+        raise RuntimeError("Too few points after downsampling for global registration.")
+
+    pcd_down.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=normal_radius, max_nn=60)
+    )
+    pcd_down.normalize_normals()
+
+    fpfh = o3d.pipelines.registration.compute_fpfh_feature(
+        pcd_down,
+        o3d.geometry.KDTreeSearchParamHybrid(radius=fpfh_radius, max_nn=120),
+    )
+    return pcd_down, fpfh
+
+
+def run_ransac_global(
+    source_down: o3d.geometry.PointCloud,
+    target_down: o3d.geometry.PointCloud,
+    source_fpfh: o3d.pipelines.registration.Feature,
+    target_fpfh: o3d.pipelines.registration.Feature,
+    max_corr_dist: float,
+) -> o3d.pipelines.registration.RegistrationResult:
+    checkers = [
+        o3d.pipelines.registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
+        o3d.pipelines.registration.CorrespondenceCheckerBasedOnDistance(max_corr_dist),
+    ]
+    criteria = o3d.pipelines.registration.RANSACConvergenceCriteria(250000, 0.999)
+
+    return o3d.pipelines.registration.registration_ransac_based_on_feature_matching(
+        source_down,
+        target_down,
+        source_fpfh,
+        target_fpfh,
+        mutual_filter=True,
+        max_correspondence_distance=max_corr_dist,
+        estimation_method=o3d.pipelines.registration.TransformationEstimationPointToPoint(
+            False
+        ),
+        ransac_n=4,
+        checkers=checkers,
+        criteria=criteria,
+    )
+
+
+def choose_device() -> o3d.core.Device:
+    try:
+        if o3d.core.cuda.is_available():
+            return o3d.core.Device("CUDA:0")
+    except Exception:
+        pass
+    return o3d.core.Device("CPU:0")
+
+
+def run_tensor_icp(
+    source_legacy: o3d.geometry.PointCloud,
+    target_legacy: o3d.geometry.PointCloud,
+    init_transform: np.ndarray,
+    max_corr_dist: float,
+    device: o3d.core.Device,
+    use_color: bool,
+) -> o3d.t.pipelines.registration.RegistrationResult:
+    src_t = o3d.t.geometry.PointCloud.from_legacy(source_legacy).to(device)
+    tgt_t = o3d.t.geometry.PointCloud.from_legacy(target_legacy).to(device)
+
+    if "normals" not in src_t.point:
+        src_t.estimate_normals(max_nn=60, radius=max_corr_dist * 2.0)
+    if "normals" not in tgt_t.point:
+        tgt_t.estimate_normals(max_nn=60, radius=max_corr_dist * 2.0)
+
+    estimation = o3d.t.pipelines.registration.TransformationEstimationPointToPlane()
+    if use_color and hasattr(
+        o3d.t.pipelines.registration, "TransformationEstimationForColoredICP"
+    ):
+        try:
+            estimation = (
+                o3d.t.pipelines.registration.TransformationEstimationForColoredICP()
+            )
+            log("Color detected: using colored ICP estimation.")
+        except Exception:
+            log("Colored ICP unavailable in this build, fallback to point-to-plane ICP.")
+
+    criteria = o3d.t.pipelines.registration.ICPConvergenceCriteria(
+        relative_fitness=1e-7,
+        relative_rmse=1e-7,
+        max_iteration=80,
+    )
+
+    init_t = o3d.core.Tensor(init_transform, dtype=o3d.core.Dtype.Float64, device=device)
+    return o3d.t.pipelines.registration.icp(
+        src_t,
+        tgt_t,
+        max_correspondence_distance=max_corr_dist,
+        init_source_to_target=init_t,
+        estimation_method=estimation,
+        criteria=criteria,
+    )
+
+
+def ensure_file(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"File not found: {path}")
+
+
+def has_valid_colors(pcd: o3d.geometry.PointCloud) -> bool:
+    return pcd.has_colors() and len(pcd.colors) == len(pcd.points) and len(pcd.points) > 0
+
+
+def merge_with_overlap_complement(
+    target: o3d.geometry.PointCloud,
+    source_aligned: o3d.geometry.PointCloud,
+    overlap_distance: float,
+) -> o3d.geometry.PointCloud:
+    """
+    Merge with complementary overlap policy:
+    - In overlap area, keep one copy only (prefer target copy).
+    - In non-overlap area, keep unique points from both clouds.
+
+    This preserves non-overlap details and avoids double-density in overlap.
+    """
+    target_tree = o3d.geometry.KDTreeFlann(target)
+    src_pts = np.asarray(source_aligned.points)
+    keep = np.ones(len(src_pts), dtype=bool)
+
+    if len(src_pts) > 0:
+        for i, p in enumerate(src_pts):
+            k, _, sq_d = target_tree.search_knn_vector_3d(p, 1)
+            if k > 0 and np.sqrt(float(sq_d[0])) <= overlap_distance:
+                keep[i] = False
+
+    source_unique = o3d.geometry.PointCloud()
+    if np.any(keep):
+        source_unique.points = o3d.utility.Vector3dVector(src_pts[keep])
+        if source_aligned.has_colors():
+            src_col = np.asarray(source_aligned.colors)
+            if len(src_col) == len(src_pts):
+                source_unique.colors = o3d.utility.Vector3dVector(src_col[keep])
+        if source_aligned.has_normals():
+            src_n = np.asarray(source_aligned.normals)
+            if len(src_n) == len(src_pts):
+                source_unique.normals = o3d.utility.Vector3dVector(src_n[keep])
+
+    merged = target + source_unique
+    merged.remove_non_finite_points()
+    merged.remove_duplicated_points()
+    return merged
+
+
+def uniform_resample_cloud(
+    pcd: o3d.geometry.PointCloud,
+    voxel_size: float,
+) -> o3d.geometry.PointCloud:
+    """
+    Enforce near-uniform density using voxel-grid resampling.
+    """
+    out = pcd.voxel_down_sample(voxel_size)
+    out.remove_non_finite_points()
+    out.remove_duplicated_points()
+    return out
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Automatic point cloud registration and fusion with Open3D."
+    )
+    parser.add_argument("--target", default="align1.ply", help="Reference point cloud")
+    parser.add_argument("--source", default="align2.ply", help="Point cloud to align")
+    parser.add_argument("--output", default="merged.ply", help="Merged output PLY path")
+    parser.add_argument(
+        "--save-transform",
+        default="transform_align2_to_align1.txt",
+        help="Path to save final 4x4 transform matrix",
+    )
+    parser.add_argument(
+        "--overlap-distance-scale",
+        type=float,
+        default=1.5,
+        help="Overlap threshold = spacing * scale; source points in overlap are removed.",
+    )
+    parser.add_argument(
+        "--uniform-voxel-scale",
+        type=float,
+        default=1.8,
+        help="Uniform resample voxel = spacing * scale (larger => lower density).",
+    )
+    parser.add_argument(
+        "--no-uniform-resample",
+        action="store_true",
+        help="Disable final uniform density resampling.",
+    )
+    args = parser.parse_args()
+
+    target_path = Path(args.target)
+    source_path = Path(args.source)
+    output_path = Path(args.output)
+    transform_path = Path(args.save_transform)
+
+    try:
+        ensure_file(target_path)
+        ensure_file(source_path)
+
+        log("Reading point clouds...")
+        target = o3d.io.read_point_cloud(str(target_path))
+        source = o3d.io.read_point_cloud(str(source_path))
+        if len(target.points) == 0 or len(source.points) == 0:
+            raise RuntimeError("Input point cloud is empty.")
+
+        log(f"Target points: {len(target.points):,}")
+        log(f"Source points: {len(source.points):,}")
+
+        params = compute_adaptive_params(target, source)
+        log("Adaptive parameters:")
+        log(f"  spacing            = {params.spacing:.8f}")
+        log(f"  voxel_size         = {params.voxel_size:.8f}")
+        log(f"  normal_radius      = {params.normal_radius:.8f}")
+        log(f"  fpfh_radius        = {params.fpfh_radius:.8f}")
+        log(f"  ransac_distance    = {params.ransac_distance:.8f}")
+        log(f"  icp_distance_coarse= {params.icp_distance_coarse:.8f}")
+        log(f"  icp_distance_fine  = {params.icp_distance_fine:.8f}")
+        log(f"  merge_voxel        = {params.merge_voxel:.8f}")
+
+        log("Preprocessing for global registration...")
+        target_down, target_fpfh = preprocess_for_global_registration(
+            target, params.voxel_size, params.normal_radius, params.fpfh_radius
+        )
+        source_down, source_fpfh = preprocess_for_global_registration(
+            source, params.voxel_size, params.normal_radius, params.fpfh_radius
+        )
+        log(f"Target downsampled points: {len(target_down.points):,}")
+        log(f"Source downsampled points: {len(source_down.points):,}")
+
+        log("Running RANSAC global registration...")
+        ransac_result = run_ransac_global(
+            source_down,
+            target_down,
+            source_fpfh,
+            target_fpfh,
+            params.ransac_distance,
+        )
+        log(
+            f"RANSAC fitness={ransac_result.fitness:.6f}, "
+            f"inlier_rmse={ransac_result.inlier_rmse:.6f}"
+        )
+
+        if ransac_result.fitness <= 1e-6:
+            log(
+                "Warning: RANSAC may have failed (very low fitness). "
+                "Fallback to identity initial transform."
+            )
+            init_transform = np.eye(4, dtype=np.float64)
+        else:
+            init_transform = np.asarray(ransac_result.transformation, dtype=np.float64)
+
+        # Prepare data for ICP (moderately downsampled to balance speed and precision).
+        icp_voxel = max(params.voxel_size * 0.5, params.spacing * 1.5)
+        target_icp = target.voxel_down_sample(icp_voxel)
+        source_icp = source.voxel_down_sample(icp_voxel)
+        target_icp.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=params.normal_radius, max_nn=80)
+        )
+        source_icp.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(radius=params.normal_radius, max_nn=80)
+        )
+
+        device = choose_device()
+        log(f"Running Tensor ICP on device: {device}")
+        use_color = has_valid_colors(target_icp) and has_valid_colors(source_icp)
+
+        # Coarse ICP.
+        icp_coarse = run_tensor_icp(
+            source_icp,
+            target_icp,
+            init_transform=init_transform,
+            max_corr_dist=params.icp_distance_coarse,
+            device=device,
+            use_color=use_color,
+        )
+        coarse_tf = icp_coarse.transformation.cpu().numpy()
+        log(
+            f"ICP coarse fitness={float(icp_coarse.fitness):.6f}, "
+            f"inlier_rmse={float(icp_coarse.inlier_rmse):.6f}"
+        )
+
+        # Fine ICP on denser clouds.
+        fine_voxel = max(params.voxel_size * 0.25, params.spacing)
+        target_fine = target.voxel_down_sample(fine_voxel)
+        source_fine = source.voxel_down_sample(fine_voxel)
+        target_fine.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=max(params.normal_radius * 0.7, params.spacing * 2.0), max_nn=100
+            )
+        )
+        source_fine.estimate_normals(
+            o3d.geometry.KDTreeSearchParamHybrid(
+                radius=max(params.normal_radius * 0.7, params.spacing * 2.0), max_nn=100
+            )
+        )
+
+        icp_fine = run_tensor_icp(
+            source_fine,
+            target_fine,
+            init_transform=coarse_tf,
+            max_corr_dist=params.icp_distance_fine,
+            device=device,
+            use_color=use_color,
+        )
+        final_transform = icp_fine.transformation.cpu().numpy()
+        final_rmse = float(icp_fine.inlier_rmse)
+        final_fitness = float(icp_fine.fitness)
+        log(
+            f"ICP fine fitness={final_fitness:.6f}, "
+            f"inlier_rmse={final_rmse:.6f}"
+        )
+
+        if final_fitness <= 1e-6:
+            log("Warning: ICP did not converge reliably. Output may be inaccurate.")
+
+        np.savetxt(transform_path, final_transform, fmt="%.10f")
+        log(f"Saved transform matrix to: {transform_path}")
+
+        log("Merging point clouds with overlap complement strategy...")
+        source_aligned = o3d.geometry.PointCloud(source)
+        source_aligned.transform(final_transform)
+
+        overlap_distance = max(params.spacing * args.overlap_distance_scale, final_rmse * 2.0)
+        log(f"Overlap distance threshold: {overlap_distance:.8f}")
+        merged = merge_with_overlap_complement(
+            target,
+            source_aligned,
+            overlap_distance=overlap_distance,
+        )
+
+        if not args.no_uniform_resample:
+            uniform_voxel = max(params.spacing * args.uniform_voxel_scale, final_rmse * 2.5)
+            before_n = len(merged.points)
+            log(f"Uniform resample voxel: {uniform_voxel:.8f}")
+            merged = uniform_resample_cloud(merged, uniform_voxel)
+            log(f"Uniform resample points: {before_n:,} -> {len(merged.points):,}")
+
+        if len(merged.points) == 0:
+            raise RuntimeError("Merged cloud is empty after fusion.")
+
+        ok = o3d.io.write_point_cloud(str(output_path), merged, write_ascii=False)
+        if not ok:
+            raise RuntimeError("Failed to save merged point cloud.")
+
+        log(f"Saved merged point cloud: {output_path} ({len(merged.points):,} points)")
+        log("Done.")
+
+        # Precision hint (unit depends on original scan unit, often meter).
+        # If unit is meter, sub-mm means RMSE < 5e-4.
+        if final_rmse < 5e-4:
+            log("Estimated alignment quality: sub-millimeter level likely achieved.")
+        else:
+            log(
+                "Estimated alignment quality: RMSE is above 0.5 mm threshold "
+                "(assuming meters as unit)."
+            )
+
+        return 0
+
+    except Exception as exc:
+        log(f"[ERROR] {exc}")
+        log("Detailed traceback:")
+        traceback.print_exc()
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

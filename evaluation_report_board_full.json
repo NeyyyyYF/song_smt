@@ -1,0 +1,35 @@
+{
+  "spacing_estimate": 0.013824912758942117,
+  "registration": {
+    "eval_voxel": 0.020737369138413175,
+    "overlap_threshold": 0.04147473827682635,
+    "overlap_ratio_source": 0.636849838724868,
+    "overlap_ratio_target": 0.6845281139502915,
+    "overlap_ratio_avg": 0.6606889763375797,
+    "overlap_rmse": 0.016271169144437016,
+    "overlap_mean": 0.01460623458667726,
+    "overlap_p95": 0.030702317855916858,
+    "all_rmse": 9.97898136604315
+  },
+  "density": {
+    "density_eval_voxel": 0.027649825517884235,
+    "nn_mean": 0.019251269822982947,
+    "nn_std": 0.00481083042947671,
+    "nn_cv": 0.2498967846647365,
+    "voxel_occ_mean": 1.5165497673602657,
+    "voxel_occ_std": 0.7309156800139609,
+    "voxel_occ_cv": 0.4819595741234435
+  },
+  "outlier": {
+    "outlier_ratio": 0.015516172521913507
+  },
+  "total_score": 63.74029537291651,
+  "grade": "C (acceptable)",
+  "score_breakdown": {
+    "registration_score_0_100": 54.87029862611548,
+    "overlap_score_0_100": 100.0,
+    "density_score_0_100": 41.2233381254898,
+    "outlier_score_0_100": 80.60478434760812
+  },
+  "unit_hint": "If your unit is meter, then 0.0005 means 0.5 mm. Use overlap_rmse to verify sub-millimeter precision."
+}
